@@ -1,4 +1,4 @@
-aiogram==2.25.2
-aiohttp==3.8.4
-python-dotenv
-openai
+aiogram==3.20.0.post0
+aiohttp==3.11.16
+apscheduler==3.10.4
+openai==1.75.0
