@@ -1,205 +1,179 @@
 import os
-import sqlite3
-import openai
 import logging
-import datetime
+import sqlite3
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardRemove
 from aiogram.utils import executor
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.dispatcher.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.markdown import hbold
+from aiogram import executor
 from dotenv import load_dotenv
 
-# Настройки
-logging.basicConfig(level=logging.INFO)
 load_dotenv()
-TELEGRAM_TOKEN = "7809028777:AAE8ez2suhZGe38HOKWEEr04qNldlkpAK5Q"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1754012821"))
 
-# Инициализация
-openai.api_key = OPENAI_API_KEY
-DB_PATH = "subscribers.db"
-CHECK_DIR = "check_images"
-os.makedirs(CHECK_DIR, exist_ok=True)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
 
-# FSM для рассылки
-class Broadcast(StatesGroup):
-    waiting_for_message = State()
+# ─── DATABASE ───────────────────────────────
+conn = sqlite3.connect("users.db")
+cur = conn.cursor()
+cur.execute('''CREATE TABLE IF NOT EXISTS subscribers (
+    user_id INTEGER PRIMARY KEY,
+    start_date TEXT,
+    is_pro INTEGER DEFAULT 0,
+    paid_until TEXT
+)''')
+conn.commit()
 
-# Инициализация бота
-storage = MemoryStorage()
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode='HTML')
-dp = Dispatcher(bot, storage=storage)
 
-# Инициализация базы данных
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS subscribers (
-            user_id INTEGER PRIMARY KEY,
-            start_date TEXT,
-            is_pro INTEGER DEFAULT 0,
-            paid_until TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+# ─── ACCESS CHECK ───────────────────────────
+def has_access(user_id: int):
+    cur.execute("SELECT start_date, is_pro, paid_until FROM subscribers WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if row:
+        start_date_str, is_pro, paid_until_str = row
+        if is_pro:
+            return True
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+        if datetime.now() <= start_date + timedelta(days=15):
+            return True
+        return False
+    return False
 
-# /start
+
+# ─── INLINE KEYBOARD ────────────────────────
+def main_menu():
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("💸 Оплата", callback_data="pay"),
+        InlineKeyboardButton("📤 Отправить чек", callback_data="send_check"),
+        InlineKeyboardButton("📋 Все команды", callback_data="menu"),
+        InlineKeyboardButton("📞 Связь с админом", url="https://t.me/mr_admincmd")
+    )
+    return markup
+
+
+# ─── /START ──────────────────────────────────
 @dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM subscribers WHERE user_id = ?", (user_id,))
+async def start_handler(message: types.Message):
+    uid = message.from_user.id
+    cur.execute("SELECT * FROM subscribers WHERE user_id = ?", (uid,))
     if not cur.fetchone():
-        cur.execute("INSERT INTO subscribers(user_id, start_date) VALUES (?, ?)", (user_id, datetime.date.today().isoformat()))
-    conn.commit()
-    conn.close()
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add("📋 Меню команд")
+        cur.execute("INSERT INTO subscribers (user_id, start_date) VALUES (?, ?)", (uid, datetime.now().strftime("%Y-%m-%d")))
+        conn.commit()
     await message.answer(
-        "Привет! Я — <b>Вера Логик</b> 🤖\n"
-        "Я помогу тебе с математикой.\n\n"
-        "📅 <b>15 дней бесплатно</b>, потом 25,000 сум/мес.\n\n"
-        "📸 Оплата: /pay\n🧾 Отправить чек: /send_check\n📋 Все команды: /menu",
-        reply_markup=keyboard
+        f"Привет! Я — <b>Вера Логик</b> 🤖\n"
+        f"Я помогу тебе с математикой.\n\n"
+        f"🕒 <b>15 дней бесплатно</b>, потом 25,000 сум/мес.\n\n"
+        f"💸 Оплата: /pay\n"
+        f"📤 Отправить чек: /send_check\n"
+        f"📋 Все команды: /menu",
+        reply_markup=main_menu()
     )
 
-# /menu
-@dp.message_handler(commands=['menu'])
-async def cmd_menu(message: types.Message):
+
+# ─── /MENU ───────────────────────────────────
+@dp.message_handler(commands=["menu"])
+async def menu(message: types.Message):
     await message.answer(
-        "📋 <b>Команды:</b>\n\n"
+        "<b>📌 Команды:</b>\n"
         "/start — начать сначала\n"
         "/menu — показать это меню\n"
         "/pay — как оплатить\n"
-        "/send_check — отправить чек"
+        "/send_check — отправить чек",
+        reply_markup=ReplyKeyboardRemove()
     )
 
-# /admin
-@dp.message_handler(commands=['admin'])
-async def admin_panel(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    conn = sqlite3.connect(DB_PATH)
-    count = conn.execute("SELECT COUNT(*) FROM subscribers").fetchone()[0]
-    conn.close()
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add("📣 Рассылка")
-    await message.answer(f"🔧 Панель администратора\n👥 Подписчиков: {count}", reply_markup=keyboard)
 
-# Рассылка по кнопке
-@dp.message_handler(lambda m: m.text == "📣 Рассылка")
-async def ask_broadcast_text(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("✉️ Введите текст, который хотите отправить подписчикам:")
-    await Broadcast.waiting_for_message.set()
-
-@dp.message_handler(state=Broadcast.waiting_for_message, content_types=types.ContentTypes.TEXT)
-async def process_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        await state.finish()
-        return
-    text = message.text
-    conn = sqlite3.connect(DB_PATH)
-    users = conn.execute("SELECT user_id FROM subscribers").fetchall()
-    conn.close()
-    count = 0
-    for (uid,) in users:
-        try:
-            await bot.send_message(uid, text)
-            count += 1
-        except:
-            continue
-    await message.answer(f"✅ Рассылка завершена. Отправлено: {count}")
-    await state.finish()
-
-# /pay
+# ─── /PAY ────────────────────────────────────
 @dp.message_handler(commands=["pay"])
-async def pay_info(message: types.Message):
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton(text="💳 Скопировать карту", callback_data="copy_card"))
-    await message.answer(
-        "💵 Оплата 25,000 сум на карту:\n<code>5614 6822 0399 1668</code>\n\nПосле оплаты — /send_check",
-        reply_markup=keyboard
-    )
+async def pay(message: types.Message):
+    await message.answer("💳 Оплата на карту: <code>5614 6822 0399 1668</code>\nПосле оплаты отправь чек с помощью /send_check")
 
-@dp.callback_query_handler(lambda c: c.data == "copy_card")
-async def copy_card(callback: types.CallbackQuery):
-    await callback.answer("Карта скопирована: 5614 6822 0399 1668", show_alert=True)
 
-# /send_check
-@dp.message_handler(commands=['send_check'])
+# ─── /SEND_CHECK ─────────────────────────────
+@dp.message_handler(commands=["send_check"])
 async def send_check(message: types.Message):
-    await message.answer("📸 Пришлите фото или скриншот чека")
+    await message.answer("📎 Пришли фото чека сюда. Я передам его админу.")
+
 
 @dp.message_handler(content_types=types.ContentType.PHOTO)
-async def handle_photo(message: types.Message):
-    file_id = message.photo[-1].file_id
-    file = await bot.get_file(file_id)
-    user_id = message.from_user.id
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"user_{user_id}_{timestamp}.jpg"
-    await bot.download_file(file.file_path, f"{CHECK_DIR}/{filename}")
-    await message.reply("✅ Чек сохранён, админ скоро проверит")
-    await bot.send_message(ADMIN_ID, f"📥 Чек от {user_id}: {filename}")
+async def handle_check(message: types.Message):
+    uid = message.from_user.id
+    photo_id = message.photo[-1].file_id
+    await bot.send_photo(ADMIN_ID, photo_id, caption=f"🧾 Новый чек от ID {uid}\nПодтвердить: /approve {uid}")
+    await message.answer("✅ Чек отправлен. Ожидайте подтверждения.")
 
-# /approve
-@dp.message_handler(commands=['approve'])
-async def approve_user(message: types.Message):
+
+# ─── /APPROVE ────────────────────────────────
+@dp.message_handler(lambda m: m.text.startswith("/approve") and m.from_user.id == ADMIN_ID)
+async def approve(message: types.Message):
+    try:
+        _, user_id = message.text.split()
+        user_id = int(user_id)
+        paid_until = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        cur.execute("UPDATE subscribers SET is_pro = 1, paid_until = ? WHERE user_id = ?", (paid_until, user_id))
+        conn.commit()
+        await bot.send_message(user_id, "✅ Оплата подтверждена! У тебя есть доступ на 30 дней. Успешной учёбы с Верой Логик 🧠")
+        await message.answer("✅ Подписка активирована.")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
+
+# ─── /ADMIN ──────────────────────────────────
+@dp.message_handler(commands=["admin"])
+async def admin(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    parts = message.text.split()
-    if len(parts) != 2:
-        return await message.reply("Формат: /approve <user_id>")
-    user_id = int(parts[1])
-    paid_until = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE subscribers SET is_pro = 1, paid_until = ? WHERE user_id = ?", (paid_until, user_id))
-    conn.commit()
-    conn.close()
-    await bot.send_message(user_id, f"✅ Подписка активна до {paid_until}")
-    await message.reply(f"✅ Пользователь {user_id} подтверждён")
+    cur.execute("SELECT COUNT(*) FROM subscribers")
+    total = cur.fetchone()[0]
+    await message.answer(f"🛠 Панель администратора\n👥 Подписчиков: {total}")
 
-# Проверка доступа
-def has_access(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT start_date, is_pro, paid_until FROM subscribers WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return False
-    start_date, is_pro, paid_until = row
-    today = datetime.date.today()
-    if is_pro == 1 and paid_until:
-        return today <= datetime.date.fromisoformat(paid_until)
-    return (today - datetime.date.fromisoformat(start_date)).days <= 15
 
-# Ответ на математику
-@dp.message_handler(lambda m: m.text and not m.text.startswith('/'), state=None)
-async def handle_math(message: types.Message):
-    user_id = message.from_user.id
-    if not has_access(user_id):
-        return await message.reply("🔒 Доступ закрыт. Оплатите через /pay и пришлите чек /send_check")
+# ─── РЕШЕНИЕ ЗАДАЧИ ─────────────────────────
+@dp.message_handler()
+async def solve_math(message: types.Message):
+    uid = message.from_user.id
+    if not has_access(uid):
+        await message.answer("🚫 Пробный период завершён. Оплати доступ — /pay")
+        return
+
+    prompt = f"Ты умный математик. Объясни решение задачи шаг за шагом:\n\n{message.text}"
+    import openai
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+
     try:
-        resp = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "Ты — репетитор по математике. Дай пошаговое решение."},
-                {"role": "user", "content": message.text}
-            ]
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}]
         )
-        ai_text = resp.choices[0].message.content.strip()
-        await message.reply(f"📘 <b>Ответ:</b>\n\n<pre>{ai_text}</pre>", parse_mode="HTML")
+        reply = response['choices'][0]['message']['content']
+        await message.answer(f"{reply}\n\n— <i>Вера Логик</i> 🧠")
     except Exception as e:
-        logging.error(f"Ошибка GPT: {e}")
-        await message.reply("⚠️ Ошибка при ответе от ИИ")
+        await message.answer(f"Ошибка при получении ответа от AI: {e}")
 
-# Запуск
-if __name__ == '__main__':
-    init_db()
+
+# ─── АВТОРАССЫЛКА НАПОМИНАНИЙ ────────────────
+from asyncio import sleep
+from aiogram import executor
+
+async def reminder_loop():
+    while True:
+        cur.execute("SELECT user_id FROM subscribers")
+        users = cur.fetchall()
+        for (user_id,) in users:
+            await bot.send_message(user_id, "📚 Не забывай практиковаться с Вера Логик! Пришли новую задачу — и я помогу.")
+            await sleep(2)
+        await sleep(3600 * 4)  # каждые 4 часа
+
+from aiogram import executor
+
+if __name__ == "__main__":
+    from asyncio import get_event_loop
+    loop = get_event_loop()
+    loop.create_task(reminder_loop())
     executor.start_polling(dp, skip_updates=True)
